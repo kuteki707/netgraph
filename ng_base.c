@@ -591,107 +591,116 @@ static const struct ng_cmdlist ng_generic_cmds[] = {
 /*
  * Instantiate a node of the requested type
  */
-int
-ng_make_node(const char *typename, node_p *nodepp)
-{
-	struct ng_type *type;
-	int	error;
-
-	/* Check that the type makes sense */
-	if (typename == NULL) {
-		TRAP_ERROR();
-		return (EINVAL);
-	}
-
-	/* Locate the node type. If we fail we return. Do not try to load
-	 * module.
-	 */
-	if ((type = ng_findtype(typename)) == NULL)
-		return (ENXIO);
-
-	/*
-	 * If we have a constructor, then make the node and
-	 * call the constructor to do type specific initialisation.
-	 */
-	if (type->constructor != NULL) {
-		if ((error = ng_make_node_common(type, nodepp)) == 0) {
-			if ((error = ((*type->constructor)(*nodepp))) != 0) {
-				NG_NODE_UNREF(*nodepp);
-			}
-		}
-	} else {
-		/*
-		 * Node has no constructor. We cannot ask for one
-		 * to be made. It must be brought into existence by
-		 * some external agency. The external agency should
-		 * call ng_make_node_common() directly to get the
-		 * netgraph part initialised.
-		 */
-		TRAP_ERROR();
-		error = EINVAL;
-	}
-	return (error);
-}
+ int
+ ng_make_node(const char *typename, node_p *nodepp)
+ {
+	 struct epoch_tracker et;
+	 struct ng_type *type;
+	 int error;
+ 
+	 /* Check that the type makes sense */
+	 if (typename == NULL) {
+		 TRAP_ERROR();
+		 return (EINVAL);
+	 }
+ 
+	 /* Locate the node type. If we fail, return without trying to load the module. */
+	 if ((type = ng_findtype(typename)) == NULL)
+		 return (ENXIO);
+ 
+	 NET_EPOCH_ENTER(et);
+ 
+	 /*
+	  * If we have a constructor, then make the node and
+	  * call the constructor to do type-specific initialization.
+	  */
+	 if (type->constructor != NULL) {
+		 if ((error = ng_make_node_common(type, nodepp)) == 0) {
+			 if ((error = ((*type->constructor)(*nodepp))) != 0) {
+				 NG_NODE_UNREF(*nodepp);
+			 }
+		 }
+	 } else {
+		 /*
+		  * Node has no constructor. We cannot ask for one
+		  * to be made. It must be brought into existence by
+		  * some external agency. The external agency should
+		  * call ng_make_node_common() directly to get the
+		  * netgraph part initialized.
+		  */
+		 TRAP_ERROR();
+		 error = EINVAL;
+	 }
+ 
+	 NET_EPOCH_EXIT(et);
+	 return (error);
+ }
 
 /*
  * Generic node creation. Called by node initialisation for externally
  * instantiated nodes (e.g. hardware, sockets, etc ).
  * The returned node has a reference count of 1.
  */
-int
-ng_make_node_common(struct ng_type *type, node_p *nodepp)
-{
-	node_p node;
-
-	/* Require the node type to have been already installed */
-	if (ng_findtype(type->name) == NULL) {
-		TRAP_ERROR();
-		return (EINVAL);
-	}
-
-	/* Make a node and try attach it to the type */
-	NG_ALLOC_NODE(node);
-	if (node == NULL) {
-		TRAP_ERROR();
-		return (ENOMEM);
-	}
-	node->nd_type = type;
-#ifdef VIMAGE
-	node->nd_vnet = curvnet;
-#endif
-	NG_NODE_REF(node);				/* note reference */
-	type->refs++;
-
-	NG_QUEUE_LOCK_INIT(&node->nd_input_queue);
-	STAILQ_INIT(&node->nd_input_queue.queue);
-	node->nd_input_queue.q_flags = 0;
-
-	/* Initialize hook list for new node */
-	LIST_INIT(&node->nd_hooks);
-
-	/* Get an ID and put us in the hash chain. */
-	IDHASH_WLOCK();
-	for (;;) { /* wrap protection, even if silly */
-		node_p node2 = NULL;
-		node->nd_ID = V_nextID++; /* 137/sec for 1 year before wrap */
-
-		/* Is there a problem with the new number? */
-		NG_IDHASH_FIND(node->nd_ID, node2); /* already taken? */
-		if ((node->nd_ID != 0) && (node2 == NULL)) {
-			break;
-		}
-	}
-	V_ng_nodes++;
-	if (V_ng_nodes * 2 > V_ng_ID_hmask)
-		ng_ID_rehash();
-	LIST_INSERT_HEAD(&V_ng_ID_hash[NG_IDHASH_FN(node->nd_ID)], node,
-	    nd_idnodes);
-	IDHASH_WUNLOCK();
-
-	/* Done */
-	*nodepp = node;
-	return (0);
-}
+ int
+ ng_make_node_common(struct ng_type *type, node_p *nodepp)
+ {
+	 struct epoch_tracker et;
+	 node_p node;
+ 
+	 /* Require the node type to have been already installed */
+	 if (ng_findtype(type->name) == NULL) {
+		 TRAP_ERROR();
+		 return (EINVAL);
+	 }
+ 
+	 NET_EPOCH_ENTER(et);
+ 
+	 /* Make a node and try to attach it to the type */
+	 NG_ALLOC_NODE(node);
+	 if (node == NULL) {
+		 TRAP_ERROR();
+		 NET_EPOCH_EXIT(et);
+		 return (ENOMEM);
+	 }
+	 node->nd_type = type;
+ #ifdef VIMAGE
+	 node->nd_vnet = curvnet;
+ #endif
+	 NG_NODE_REF(node); /* note reference */
+	 type->refs++;
+ 
+	 NG_QUEUE_LOCK_INIT(&node->nd_input_queue);
+	 STAILQ_INIT(&node->nd_input_queue.queue);
+	 node->nd_input_queue.q_flags = 0;
+ 
+	 /* Initialize hook list for new node */
+	 LIST_INIT(&node->nd_hooks);
+ 
+	 /* Get an ID and put us in the hash chain */
+	 IDHASH_WLOCK();
+	 for (;;) { /* wrap protection, even if silly */
+		 node_p node2 = NULL;
+		 node->nd_ID = V_nextID++; /* 137/sec for 1 year before wrap */
+ 
+		 /* Is there a problem with the new number? */
+		 NG_IDHASH_FIND(node->nd_ID, node2); /* already taken? */
+		 if ((node->nd_ID != 0) && (node2 == NULL)) {
+			 break;
+		 }
+	 }
+	 V_ng_nodes++;
+	 if (V_ng_nodes * 2 > V_ng_ID_hmask)
+		 ng_ID_rehash();
+	 LIST_INSERT_HEAD(&V_ng_ID_hash[NG_IDHASH_FN(node->nd_ID)], node,
+					  nd_idnodes);
+	 IDHASH_WUNLOCK();
+ 
+	 NET_EPOCH_EXIT(et);
+ 
+	 /* Done */
+	 *nodepp = node;
+	 return (0);
+ }
 
 /*
  * Forceably start the shutdown process on a node. Either call
@@ -1548,63 +1557,72 @@ ng_con_nodes(item_p item, node_p node, const char *name,
  * Unless of course we just ignore failure to connect and leave
  * an unconnected node?
  */
-static int
-ng_mkpeer(node_p node, const char *name, const char *name2, char *type)
-{
-	node_p	node2;
-	hook_p	hook1, hook2;
-	int	error;
-
-	if ((error = ng_make_node(type, &node2))) {
-		return (error);
-	}
-
-	if ((error = ng_add_hook(node, name, &hook1))) { /* gives us a ref */
-		ng_rmnode(node2, NULL, NULL, 0);
-		return (error);
-	}
-
-	if ((error = ng_add_hook(node2, name2, &hook2))) {
-		ng_rmnode(node2, NULL, NULL, 0);
-		ng_destroy_hook(hook1);
-		NG_HOOK_UNREF(hook1);
-		return (error);
-	}
-
-	/*
-	 * Actually link the two hooks together.
-	 */
-	hook1->hk_peer = hook2;
-	hook2->hk_peer = hook1;
-
-	/* Each hook is referenced by the other */
-	NG_HOOK_REF(hook1);
-	NG_HOOK_REF(hook2);
-
-	/* Give each node the opportunity to veto the pending connection */
-	if (hook1->hk_node->nd_type->connect) {
-		error = (*hook1->hk_node->nd_type->connect) (hook1);
-	}
-
-	if ((error == 0) && hook2->hk_node->nd_type->connect) {
-		error = (*hook2->hk_node->nd_type->connect) (hook2);
-	}
-
-	/*
-	 * drop the references we were holding on the two hooks.
-	 */
-	if (error) {
-		ng_destroy_hook(hook2);	/* also zaps hook1 */
-		ng_rmnode(node2, NULL, NULL, 0);
-	} else {
-		/* As a last act, allow the hooks to be used */
-		hook1->hk_flags &= ~HK_INVALID;
-		hook2->hk_flags &= ~HK_INVALID;
-	}
-	NG_HOOK_UNREF(hook1);
-	NG_HOOK_UNREF(hook2);
-	return (error);
-}
+ int
+ ng_mkpeer(node_p node, const char *name, const char *name2, char *type)
+ {
+	 struct epoch_tracker et;
+	 node_p node2;
+	 hook_p hook1, hook2;
+	 int error;
+ 
+	 NET_EPOCH_ENTER(et);
+ 
+	 if ((error = ng_make_node(type, &node2))) {
+		 NET_EPOCH_EXIT(et);
+		 return (error);
+	 }
+ 
+	 if ((error = ng_add_hook(node, name, &hook1))) { /* gives us a ref */
+		 ng_rmnode(node2, NULL, NULL, 0);
+		 NET_EPOCH_EXIT(et);
+		 return (error);
+	 }
+ 
+	 if ((error = ng_add_hook(node2, name2, &hook2))) {
+		 ng_rmnode(node2, NULL, NULL, 0);
+		 ng_destroy_hook(hook1);
+		 NG_HOOK_UNREF(hook1);
+		 NET_EPOCH_EXIT(et);
+		 return (error);
+	 }
+ 
+	 /*
+	  * Actually link the two hooks together.
+	  */
+	 hook1->hk_peer = hook2;
+	 hook2->hk_peer = hook1;
+ 
+	 /* Each hook is referenced by the other */
+	 NG_HOOK_REF(hook1);
+	 NG_HOOK_REF(hook2);
+ 
+	 /* Give each node the opportunity to veto the pending connection */
+	 if (hook1->hk_node->nd_type->connect) {
+		 error = (*hook1->hk_node->nd_type->connect)(hook1);
+	 }
+ 
+	 if ((error == 0) && hook2->hk_node->nd_type->connect) {
+		 error = (*hook2->hk_node->nd_type->connect)(hook2);
+	 }
+ 
+	 /*
+	  * Drop the references we were holding on the two hooks.
+	  */
+	 if (error) {
+		 ng_destroy_hook(hook2); /* also zaps hook1 */
+		 ng_rmnode(node2, NULL, NULL, 0);
+	 } else {
+		 /* As a last act, allow the hooks to be used */
+		 hook1->hk_flags &= ~HK_INVALID;
+		 hook2->hk_flags &= ~HK_INVALID;
+	 }
+ 
+	 NG_HOOK_UNREF(hook1);
+	 NG_HOOK_UNREF(hook2);
+ 
+	 NET_EPOCH_EXIT(et);
+	 return (error);
+ }
 
 /************************************************************************
 		Utility routines to send self messages
