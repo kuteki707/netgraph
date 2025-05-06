@@ -247,6 +247,7 @@ int	ng_path_parse(char *addr, char **node, char **path, char **hook);
 void	ng_rmnode(node_p node, hook_p dummy1, void *dummy2, int dummy3);
 void	ng_unname(node_p node);
 
+
 /* Our own netgraph malloc type */
 MALLOC_DEFINE(M_NETGRAPH, "netgraph", "netgraph structures and ctrl messages");
 MALLOC_DEFINE(M_NETGRAPH_MSG, "netgraph_msg", "netgraph name storage");
@@ -474,6 +475,7 @@ static const struct ng_parse_type ng_generic_linkinfo_array_type = {
 	&ng_parse_array_type,
 	&ng_generic_linkinfo_array_type_info
 };
+static __thread STAILQ_HEAD(, ng_node) local_worklist = STAILQ_HEAD_INITIALIZER(local_worklist);
 
 DEFINE_PARSE_STRUCT_TYPE(typelist, TYPELIST, (&ng_generic_typeinfoarray_type));
 DEFINE_PARSE_STRUCT_TYPE(hooklist, HOOKLIST,
@@ -3146,85 +3148,73 @@ SYSCTL_PROC(_debug, OID_AUTO, ng_dump_items,
  * Pick a node off the list of nodes with work,
  * try get an item to process off it. Remove the node from the list.
  */
-static void
-ngthread(void *arg)
-{
-	for (;;) {
-		struct epoch_tracker et;
-		node_p  node;
-
-		/* Get node from the worklist. */
-		NG_WORKLIST_LOCK();
-		while ((node = STAILQ_FIRST(&ng_worklist)) == NULL)
-			NG_WORKLIST_SLEEP();
-		STAILQ_REMOVE_HEAD(&ng_worklist, nd_input_queue.q_work);
-		NG_WORKLIST_UNLOCK();
-		CURVNET_SET(node->nd_vnet);
-		CTR3(KTR_NET, "%20s: node [%x] (%p) taken off worklist",
-		    __func__, node->nd_ID, node);
-		/*
-		 * We have the node. We also take over the reference
-		 * that the list had on it.
-		 * Now process as much as you can, until it won't
-		 * let you have another item off the queue.
-		 * All this time, keep the reference
-		 * that lets us be sure that the node still exists.
-		 * Let the reference go at the last minute.
-		 */
-		NET_EPOCH_ENTER(et);
-		for (;;) {
-			item_p item;
-			int rw;
-
-			NG_QUEUE_LOCK(&node->nd_input_queue);
-			item = ng_dequeue(node, &rw);
-			if (item == NULL) {
-				node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
-				NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				break; /* go look for another node */
-			} else {
-				NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				NGI_GET_NODE(item, node); /* zaps stored node */
-
-				if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
-					/*
-					 * NGQF_MESG items should never be processed in
-					 * NET_EPOCH context. So, temporary exit from EPOCH.
-					 */
-					NET_EPOCH_EXIT(et);
-					ng_apply_item(node, item, rw);
-					NET_EPOCH_ENTER(et);
-				} else {
-					ng_apply_item(node, item, rw);
-				}
-
-				NG_NODE_UNREF(node);
-			}
-		}
-		NET_EPOCH_EXIT(et);
-		NG_NODE_UNREF(node);
-		CURVNET_RESTORE();
-	}
-}
+ static void
+ ngthread(void *arg)
+ {
+	 for (;;) {
+		 struct epoch_tracker et;
+		 node_p node;
+ 
+		 /* Get node from the local worklist */
+		 while ((node = STAILQ_FIRST(&local_worklist)) == NULL)
+			 NG_WORKLIST_SLEEP();
+		 STAILQ_REMOVE_HEAD(&local_worklist, nd_input_queue.q_work);
+ 
+		 CURVNET_SET(node->nd_vnet);
+		 CTR3(KTR_NET, "%20s: node [%x] (%p) taken off worklist",
+			 __func__, node->nd_ID, node);
+ 
+		 /* Process the node's items */
+		 NET_EPOCH_ENTER(et);
+		 for (;;) {
+			 item_p item;
+			 int rw;
+ 
+			 NG_QUEUE_LOCK(&node->nd_input_queue);
+			 item = ng_dequeue(node, &rw);
+			 if (item == NULL) {
+				 node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
+				 NG_QUEUE_UNLOCK(&node->nd_input_queue);
+				 break; /* go look for another node */
+			 } else {
+				 NG_QUEUE_UNLOCK(&node->nd_input_queue);
+				 NGI_GET_NODE(item, node); /* zaps stored node */
+ 
+				 if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
+					 /* Temporarily exit epoch for message processing */
+					 NET_EPOCH_EXIT(et);
+					 ng_apply_item(node, item, rw);
+					 NET_EPOCH_ENTER(et);
+				 } else {
+					 ng_apply_item(node, item, rw);
+				 }
+ 
+				 NG_NODE_UNREF(node);
+			 }
+		 }
+		 NET_EPOCH_EXIT(et);
+		 NG_NODE_UNREF(node);
+		 CURVNET_RESTORE();
+	 }
+ }
 
 /*
  * XXX
  * It's possible that a debugging NG_NODE_REF may need
  * to be outside the mutex zone
  */
-static void
-ng_worklist_add(node_p node)
-{
-    mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
-
-    if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
-        node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
-        NG_NODE_REF(node);
-        STAILQ_INSERT_TAIL(&local_worklist, node, nd_input_queue.q_work);
-        NG_WORKLIST_WAKEUP();
-    }
-}
-
+ static void
+ ng_worklist_add(node_p node)
+ {
+	 mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
+ 
+	 if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
+		 node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
+		 NG_NODE_REF(node);
+		 STAILQ_INSERT_TAIL(&local_worklist, node, nd_input_queue.q_work);
+		 NG_WORKLIST_WAKEUP();
+	 }
+ }
 /***********************************************************************
 * Externally useable functions to set up a queue item ready for sending
 ***********************************************************************/
