@@ -482,7 +482,7 @@ DEFINE_PARSE_STRUCT_TYPE(listnodes, LISTNODES,
 	(&ng_generic_nodeinfoarray_type));
 
 /* List of commands and how to convert arguments to/from ASCII */
-static const struct ng_cmdlist ng_generic_cmds[] = {
+static const struct ng_cmdlist ng_generic_cmds[] __unused = {
 	{
 	  NGM_GENERIC_COOKIE,
 	  NGM_SHUTDOWN,
@@ -2248,136 +2248,123 @@ ng_flush_input_queue(node_p node)
  * The nodes have several routines and macros to help with this task:
  */
 
-int
-ng_snd_item(item_p item, int flags)
-{
-	hook_p hook;
-	node_p node;
-	int queue, rw;
-	struct ng_queue *ngq;
-	int error = 0;
-
-	/* We are sending item, so it must be present! */
-	KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
-
-#ifdef	NETGRAPH_DEBUG
-	_ngi_check(item, __FILE__, __LINE__);
-#endif
-
-	/* Item was sent once more, postpone apply() call. */
-	if (item->apply)
-		refcount_acquire(&item->apply->refs);
-
-	node = NGI_NODE(item);
-	/* Node is never optional. */
-	KASSERT(node != NULL, ("ng_snd_item: node is NULL"));
-
-	hook = NGI_HOOK(item);
-	/* Valid hook and mbuf are mandatory for data. */
-	if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
-		KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
-		if (NGI_M(item) == NULL)
-			ERROUT(EINVAL);
-		CHECK_DATA_MBUF(NGI_M(item));
-	}
-
-	/*
-	 * If the item or the node specifies single threading, force
-	 * writer semantics. Similarly, the node may say one hook always
-	 * produces writers. These are overrides.
-	 */
-	if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
-	    (node->nd_flags & NGF_FORCE_WRITER) ||
-	    (hook && (hook->hk_flags & HK_FORCE_WRITER))) {
-		rw = NGQRW_W;
-	} else {
-		rw = NGQRW_R;
-	}
-
-	/*
-	 * If sender or receiver requests queued delivery, or call graph
-	 * loops back from outbound to inbound path, or stack usage
-	 * level is dangerous - enqueue message.
-	 */
-	if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
-		queue = 1;
-	} else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
-	    curthread->td_ng_outbound) {
-		queue = 1;
-	} else {
-		queue = 0;
-
-		/*
-		 * Most of netgraph nodes have small stack consumption and
-		 * for them 25% of free stack space is more than enough.
-		 * Nodes/hooks with higher stack usage should be marked as
-		 * HI_STACK. For them 50% of stack will be guaranteed then.
-		 * XXX: Values 25% and 50% are completely empirical.
-		 */
-		size_t	st, su, sl;
-		GET_STACK_USAGE(st, su);
-		sl = st - su;
-		if ((sl * 4 < st) || ((sl * 2 < st) &&
-		    ((node->nd_flags & NGF_HI_STACK) || (hook &&
-		    (hook->hk_flags & HK_HI_STACK)))))
-			queue = 1;
-	}
-
-	if (queue) {
-		/* Put it on the queue for that node*/
-		ng_queue_rw(node, item, rw);
-		return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
-	}
-
-	/*
-	 * We already decided how we will be queueud or treated.
-	 * Try get the appropriate operating permission.
-	 */
- 	if (rw == NGQRW_R)
-		item = ng_acquire_read(node, item);
-	else
-		item = ng_acquire_write(node, item);
-
-	/* Item was queued while trying to get permission. */
-	if (item == NULL)
-		return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
-
-	NGI_GET_NODE(item, node); /* zaps stored node */
-
-	item->depth++;
-	error = ng_apply_item(node, item, rw); /* drops r/w lock when done */
-
-	/* If something is waiting on queue and ready, schedule it. */
-	ngq = &node->nd_input_queue;
-	if (QUEUE_ACTIVE(ngq)) {
-		NG_QUEUE_LOCK(ngq);
-		if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-			ng_worklist_add(node);
-		NG_QUEUE_UNLOCK(ngq);
-	}
-
-	/*
-	 * Node may go away as soon as we remove the reference.
-	 * Whatever we do, DO NOT access the node again!
-	 */
-	NG_NODE_UNREF(node);
-
-	return (error);
-
-done:
-	/* If was not sent, apply callback here. */
-	if (item->apply != NULL) {
-		if (item->depth == 0 && error != 0)
-			item->apply->error = error;
-		if (refcount_release(&item->apply->refs)) {
-			(*item->apply->apply)(item->apply->context,
-			    item->apply->error);
-		}
-	}
-
-	NG_FREE_ITEM(item);
-	return (error);
-}
+ int
+ ng_snd_item(item_p item, int flags)
+ {
+	 hook_p hook;
+	 node_p node;
+	 int queue, rw;
+	 struct ng_queue *ngq;
+	 int error = 0;
+ 
+	 /* Ensure the item is valid */
+	 KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
+ 
+ #ifdef NETGRAPH_DEBUG
+	 _ngi_check(item, __FILE__, __LINE__);
+ #endif
+ 
+	 /* Increment reference count for apply callback if present */
+	 if (item->apply)
+		 refcount_acquire(&item->apply->refs);
+ 
+	 node = NGI_NODE(item);
+	 KASSERT(node != NULL, ("ng_snd_item: node is NULL"));
+ 
+	 hook = NGI_HOOK(item);
+ 
+	 /* Validate data items */
+	 if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
+		 KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
+		 if (NGI_M(item) == NULL)
+			 ERROUT(EINVAL);
+		 CHECK_DATA_MBUF(NGI_M(item));
+	 }
+ 
+	 /* Determine if the item requires writer semantics */
+	 if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
+		 (node->nd_flags & NGF_FORCE_WRITER) ||
+		 (hook && (hook->hk_flags & HK_FORCE_WRITER))) {
+		 rw = NGQRW_W;
+	 } else {
+		 rw = NGQRW_R;
+	 }
+ 
+	 /* Decide whether to queue the item */
+	 if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
+		 queue = 1;
+	 } else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
+				curthread->td_ng_outbound) {
+		 queue = 1;
+	 } else {
+		 queue = 0;
+ 
+		 /* Check stack usage to decide if queuing is necessary */
+		 size_t st, su, sl;
+		 GET_STACK_USAGE(st, su);
+		 sl = st - su;
+		 if ((sl * 4 < st) || ((sl * 2 < st) &&
+			 ((node->nd_flags & NGF_HI_STACK) || (hook &&
+			 (hook->hk_flags & HK_HI_STACK)))))
+			 queue = 1;
+	 }
+ 
+	 if (queue) {
+		 /* Queue the item for later processing */
+		 ng_queue_rw(node, item, rw);
+		 return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
+	 }
+ 
+	 /* Enter epoch for safe concurrent access */
+	 struct epoch_tracker et;
+	 NET_EPOCH_ENTER(et);
+ 
+	 /* Attempt to acquire the appropriate lock */
+	 if (rw == NGQRW_R)
+		 item = ng_acquire_read(node, item);
+	 else
+		 item = ng_acquire_write(node, item);
+ 
+	 /* If the item was queued, return */
+	 if (item == NULL) {
+		 NET_EPOCH_EXIT(et);
+		 return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
+	 }
+ 
+	 /* Process the item */
+	 NGI_GET_NODE(item, node); /* Clear stored node */
+	 item->depth++;
+	 error = ng_apply_item(node, item, rw); /* Drops r/w lock when done */
+ 
+	 /* Check if there are more items in the queue */
+	 ngq = &node->nd_input_queue;
+	 if (QUEUE_ACTIVE(ngq)) {
+		 NG_QUEUE_LOCK(ngq);
+		 if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
+			 ng_worklist_add(node);
+		 NG_QUEUE_UNLOCK(ngq);
+	 }
+ 
+	 /* Release the node reference */
+	 NG_NODE_UNREF(node);
+ 
+	 NET_EPOCH_EXIT(et);
+	 return (error);
+ 
+ done:
+	 /* Handle errors and apply callback if necessary */
+	 if (item->apply != NULL) {
+		 if (item->depth == 0 && error != 0)
+			 item->apply->error = error;
+		 if (refcount_release(&item->apply->refs)) {
+			 (*item->apply->apply)(item->apply->context,
+								   item->apply->error);
+		 }
+	 }
+ 
+	 NG_FREE_ITEM(item);
+	 return (error);
+ }
 
 /*
  * We have an item that was possibly queued somewhere.
@@ -3228,26 +3215,14 @@ ngthread(void *arg)
 static void
 ng_worklist_add(node_p node)
 {
+    mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
 
-	mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
-
-	if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
-		/*
-		 * If we are not already on the work queue,
-		 * then put us on.
-		 */
-		node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
-		NG_NODE_REF(node); /* XXX safe in mutex? */
-		NG_WORKLIST_LOCK();
-		STAILQ_INSERT_TAIL(&ng_worklist, node, nd_input_queue.q_work);
-		NG_WORKLIST_UNLOCK();
-		CTR3(KTR_NET, "%20s: node [%x] (%p) put on worklist", __func__,
-		    node->nd_ID, node);
-		NG_WORKLIST_WAKEUP();
-	} else {
-		CTR3(KTR_NET, "%20s: node [%x] (%p) already on worklist",
-		    __func__, node->nd_ID, node);
-	}
+    if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
+        node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
+        NG_NODE_REF(node);
+        STAILQ_INSERT_TAIL(&local_worklist, node, nd_input_queue.q_work);
+        NG_WORKLIST_WAKEUP();
+    }
 }
 
 /***********************************************************************
