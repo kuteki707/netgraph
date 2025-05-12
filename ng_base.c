@@ -247,7 +247,6 @@ int	ng_path_parse(char *addr, char **node, char **path, char **hook);
 void	ng_rmnode(node_p node, hook_p dummy1, void *dummy2, int dummy3);
 void	ng_unname(node_p node);
 
-
 /* Our own netgraph malloc type */
 MALLOC_DEFINE(M_NETGRAPH, "netgraph", "netgraph structures and ctrl messages");
 MALLOC_DEFINE(M_NETGRAPH_MSG, "netgraph_msg", "netgraph name storage");
@@ -475,7 +474,6 @@ static const struct ng_parse_type ng_generic_linkinfo_array_type = {
 	&ng_parse_array_type,
 	&ng_generic_linkinfo_array_type_info
 };
-static __thread STAILQ_HEAD(, ng_node) local_worklist = STAILQ_HEAD_INITIALIZER(local_worklist);
 
 DEFINE_PARSE_STRUCT_TYPE(typelist, TYPELIST, (&ng_generic_typeinfoarray_type));
 DEFINE_PARSE_STRUCT_TYPE(hooklist, HOOKLIST,
@@ -2041,30 +2039,36 @@ ng_dequeue(node_p node, int *rw)
  * If the queue could be run now, add node to the queue handler's worklist.
  */
 static __inline void
-ng_queue_rw(node_p node, item_p  item, int rw)
+ng_queue_rw(node_p node, item_p item, int rw)
 {
-	struct ng_queue *ngq = &node->nd_input_queue;
-	if (rw == NGQRW_W)
-		NGI_SET_WRITER(item);
-	else
-		NGI_SET_READER(item);
-	item->depth = 1;
+    struct ng_queue *ngq = &node->nd_input_queue;
+    if (rw == NGQRW_W)
+        NGI_SET_WRITER(item);
+    else
+        NGI_SET_READER(item);
+    item->depth = 1;
 
-	NG_QUEUE_LOCK(ngq);
-	/* Set OP_PENDING flag and enqueue the item. */
-	atomic_set_int(&ngq->q_flags, OP_PENDING);
-	STAILQ_INSERT_TAIL(&ngq->queue, item, el_next);
+    /* Lock-free enqueue using STAILQ semantics */
+    struct ng_item **tail;
+    do {
+        tail = ngq->queue.stqh_last;
+        item->el_next.stqe_next = NULL;  // Correct field name
+    } while (!atomic_cmpset_ptr((uintptr_t *)tail,
+                               (uintptr_t)NULL,  // Compare expected NULL tail
+                               (uintptr_t)item)); // Set new item as tail
 
-	CTR5(KTR_NET, "%20s: node [%x] (%p) queued item %p as %s", __func__,
-	    node->nd_ID, node, item, rw ? "WRITER" : "READER" );
+    /* Update flags atomically if needed */
+    if (!(atomic_load_acq_int(&ngq->q_flags) & OP_PENDING))
+        atomic_set_rel_int(&ngq->q_flags, OP_PENDING);
 
-	/*
-	 * We can take the worklist lock with the node locked
-	 * BUT NOT THE REVERSE!
-	 */
-	if (NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-		ng_worklist_add(node);
-	NG_QUEUE_UNLOCK(ngq);
+    CTR5(KTR_NET, "%20s: node [%x] (%p) queued item %p as %s", __func__,
+        node->nd_ID, node, item, rw ? "WRITER" : "READER");
+
+    /* Worklist addition remains locked */
+    NG_QUEUE_LOCK(ngq);
+    if (NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
+        ng_worklist_add(node);
+    NG_QUEUE_UNLOCK(ngq);
 }
 
 /* Acquire reader lock on node. If node is busy, queue the packet. */
@@ -2250,123 +2254,123 @@ ng_flush_input_queue(node_p node)
  * The nodes have several routines and macros to help with this task:
  */
 
- int
- ng_snd_item(item_p item, int flags)
- {
-	 hook_p hook;
-	 node_p node;
-	 int queue, rw;
-	 struct ng_queue *ngq;
-	 int error = 0;
- 
-	 /* Ensure the item is valid */
-	 KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
- 
- #ifdef NETGRAPH_DEBUG
-	 _ngi_check(item, __FILE__, __LINE__);
- #endif
- 
-	 /* Increment reference count for apply callback if present */
-	 if (item->apply)
-		 refcount_acquire(&item->apply->refs);
- 
-	 node = NGI_NODE(item);
-	 KASSERT(node != NULL, ("ng_snd_item: node is NULL"));
- 
-	 hook = NGI_HOOK(item);
- 
-	 /* Validate data items */
-	 if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
-		 KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
-		 if (NGI_M(item) == NULL)
-			 ERROUT(EINVAL);
-		 CHECK_DATA_MBUF(NGI_M(item));
-	 }
- 
-	 /* Determine if the item requires writer semantics */
-	 if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
-		 (node->nd_flags & NGF_FORCE_WRITER) ||
-		 (hook && (hook->hk_flags & HK_FORCE_WRITER))) {
-		 rw = NGQRW_W;
-	 } else {
-		 rw = NGQRW_R;
-	 }
- 
-	 /* Decide whether to queue the item */
-	 if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
-		 queue = 1;
-	 } else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
-				curthread->td_ng_outbound) {
-		 queue = 1;
-	 } else {
-		 queue = 0;
- 
-		 /* Check stack usage to decide if queuing is necessary */
-		 size_t st, su, sl;
-		 GET_STACK_USAGE(st, su);
-		 sl = st - su;
-		 if ((sl * 4 < st) || ((sl * 2 < st) &&
-			 ((node->nd_flags & NGF_HI_STACK) || (hook &&
-			 (hook->hk_flags & HK_HI_STACK)))))
-			 queue = 1;
-	 }
- 
-	 if (queue) {
-		 /* Queue the item for later processing */
-		 ng_queue_rw(node, item, rw);
-		 return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
-	 }
- 
-	 /* Enter epoch for safe concurrent access */
-	 struct epoch_tracker et;
-	 NET_EPOCH_ENTER(et);
- 
-	 /* Attempt to acquire the appropriate lock */
-	 if (rw == NGQRW_R)
-		 item = ng_acquire_read(node, item);
-	 else
-		 item = ng_acquire_write(node, item);
- 
-	 /* If the item was queued, return */
-	 if (item == NULL) {
-		 NET_EPOCH_EXIT(et);
-		 return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
-	 }
- 
-	 /* Process the item */
-	 NGI_GET_NODE(item, node); /* Clear stored node */
-	 item->depth++;
-	 error = ng_apply_item(node, item, rw); /* Drops r/w lock when done */
- 
-	 /* Check if there are more items in the queue */
-	 ngq = &node->nd_input_queue;
-	 if (QUEUE_ACTIVE(ngq)) {
-		 NG_QUEUE_LOCK(ngq);
-		 if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-			 ng_worklist_add(node);
-		 NG_QUEUE_UNLOCK(ngq);
-	 }
- 
-	 /* Release the node reference */
-	 NG_NODE_UNREF(node);
- 
-	 NET_EPOCH_EXIT(et);
-	 return (error);
- 
- done:
-	 /* Handle errors and apply callback if necessary */
-	 if (item->apply != NULL) {
-		 if (item->depth == 0 && error != 0)
-			 item->apply->error = error;
-		 if (refcount_release(&item->apply->refs)) {
-			 (*item->apply->apply)(item->apply->context,
-								   item->apply->error);
-		 }
-	 }
- 
-	 NG_FREE_ITEM(item);
-	 return (error);
- }
+int
+ng_snd_item(item_p item, int flags)
+{
+    hook_p hook;
+    node_p node;
+    int queue, rw;
+    struct ng_queue *ngq;
+    int error = 0;
+
+    /* Ensure the item is valid */
+    KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
+
+#ifdef NETGRAPH_DEBUG
+    _ngi_check(item, __FILE__, __LINE__);
+#endif
+
+    /* Increment reference count for apply callback if present */
+    if (item->apply)
+        refcount_acquire(&item->apply->refs);
+
+    node = NGI_NODE(item);
+    KASSERT(node != NULL, ("ng_snd_item: node is NULL"));
+
+    hook = NGI_HOOK(item);
+
+    /* Validate data items */
+    if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
+        KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
+        if (NGI_M(item) == NULL)
+            ERROUT(EINVAL);
+        CHECK_DATA_MBUF(NGI_M(item));
+    }
+
+    /* Determine if the item requires writer semantics */
+    if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
+        (node->nd_flags & NGF_FORCE_WRITER) ||
+        (hook && (hook->hk_flags & HK_FORCE_WRITER))) {
+        rw = NGQRW_W;
+    } else {
+        rw = NGQRW_R;
+    }
+
+    /* Decide whether to queue the item */
+    if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
+        queue = 1;
+    } else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
+               curthread->td_ng_outbound) {
+        queue = 1;
+    } else {
+        queue = 0;
+
+        /* Check stack usage to decide if queuing is necessary */
+        size_t st, su, sl;
+        GET_STACK_USAGE(st, su);
+        sl = st - su;
+        if ((sl * 4 < st) || ((sl * 2 < st) &&
+            ((node->nd_flags & NGF_HI_STACK) || (hook &&
+            (hook->hk_flags & HK_HI_STACK)))))
+            queue = 1;
+    }
+
+    if (queue) {
+        /* Queue the item for later processing */
+        ng_queue_rw(node, item, rw);
+        return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
+    }
+
+    /* Enter epoch for safe concurrent access */
+    struct epoch_tracker et;
+    NET_EPOCH_ENTER(et);
+
+    /* Attempt to acquire the appropriate lock */
+    if (rw == NGQRW_R)
+        item = ng_acquire_read(node, item);
+    else
+        item = ng_acquire_write(node, item);
+
+    /* If the item was queued, return */
+    if (item == NULL) {
+        NET_EPOCH_EXIT(et);
+        return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
+    }
+
+    /* Process the item */
+    NGI_GET_NODE(item, node); /* Clear stored node */
+    item->depth++;
+    error = ng_apply_item(node, item, rw); /* Drops r/w lock when done */
+
+    /* Check if there are more items in the queue */
+    ngq = &node->nd_input_queue;
+    if (QUEUE_ACTIVE(ngq)) {
+        NG_QUEUE_LOCK(ngq);
+        if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
+            ng_worklist_add(node);
+        NG_QUEUE_UNLOCK(ngq);
+    }
+
+    /* Release the node reference */
+    NG_NODE_UNREF(node);
+
+    NET_EPOCH_EXIT(et);
+    return (error);
+
+done:
+    /* Handle errors and apply callback if necessary */
+    if (item->apply != NULL) {
+        if (item->depth == 0 && error != 0)
+            item->apply->error = error;
+        if (refcount_release(&item->apply->refs)) {
+            (*item->apply->apply)(item->apply->context,
+                                  item->apply->error);
+        }
+    }
+
+    NG_FREE_ITEM(item);
+    return (error);
+}
 
 /*
  * We have an item that was possibly queued somewhere.
@@ -3148,73 +3152,97 @@ SYSCTL_PROC(_debug, OID_AUTO, ng_dump_items,
  * Pick a node off the list of nodes with work,
  * try get an item to process off it. Remove the node from the list.
  */
- static void
- ngthread(void *arg)
- {
-	 for (;;) {
-		 struct epoch_tracker et;
-		 node_p node;
- 
-		 /* Get node from the local worklist */
-		 while ((node = STAILQ_FIRST(&local_worklist)) == NULL)
-			 NG_WORKLIST_SLEEP();
-		 STAILQ_REMOVE_HEAD(&local_worklist, nd_input_queue.q_work);
- 
-		 CURVNET_SET(node->nd_vnet);
-		 CTR3(KTR_NET, "%20s: node [%x] (%p) taken off worklist",
-			 __func__, node->nd_ID, node);
- 
-		 /* Process the node's items */
-		 NET_EPOCH_ENTER(et);
-		 for (;;) {
-			 item_p item;
-			 int rw;
- 
-			 NG_QUEUE_LOCK(&node->nd_input_queue);
-			 item = ng_dequeue(node, &rw);
-			 if (item == NULL) {
-				 node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
-				 NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				 break; /* go look for another node */
-			 } else {
-				 NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				 NGI_GET_NODE(item, node); /* zaps stored node */
- 
-				 if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
-					 /* Temporarily exit epoch for message processing */
-					 NET_EPOCH_EXIT(et);
-					 ng_apply_item(node, item, rw);
-					 NET_EPOCH_ENTER(et);
-				 } else {
-					 ng_apply_item(node, item, rw);
-				 }
- 
-				 NG_NODE_UNREF(node);
-			 }
-		 }
-		 NET_EPOCH_EXIT(et);
-		 NG_NODE_UNREF(node);
-		 CURVNET_RESTORE();
-	 }
- }
+static void
+ngthread(void *arg)
+{
+	for (;;) {
+		struct epoch_tracker et;
+		node_p  node;
+
+		/* Get node from the worklist. */
+		NG_WORKLIST_LOCK();
+		while ((node = STAILQ_FIRST(&ng_worklist)) == NULL)
+			NG_WORKLIST_SLEEP();
+		STAILQ_REMOVE_HEAD(&ng_worklist, nd_input_queue.q_work);
+		NG_WORKLIST_UNLOCK();
+		CURVNET_SET(node->nd_vnet);
+		CTR3(KTR_NET, "%20s: node [%x] (%p) taken off worklist",
+		    __func__, node->nd_ID, node);
+		/*
+		 * We have the node. We also take over the reference
+		 * that the list had on it.
+		 * Now process as much as you can, until it won't
+		 * let you have another item off the queue.
+		 * All this time, keep the reference
+		 * that lets us be sure that the node still exists.
+		 * Let the reference go at the last minute.
+		 */
+		NET_EPOCH_ENTER(et);
+		for (;;) {
+			item_p item;
+			int rw;
+
+			NG_QUEUE_LOCK(&node->nd_input_queue);
+			item = ng_dequeue(node, &rw);
+			if (item == NULL) {
+				node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
+				NG_QUEUE_UNLOCK(&node->nd_input_queue);
+				break; /* go look for another node */
+			} else {
+				NG_QUEUE_UNLOCK(&node->nd_input_queue);
+				NGI_GET_NODE(item, node); /* zaps stored node */
+
+				if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
+					/*
+					 * NGQF_MESG items should never be processed in
+					 * NET_EPOCH context. So, temporary exit from EPOCH.
+					 */
+					NET_EPOCH_EXIT(et);
+					ng_apply_item(node, item, rw);
+					NET_EPOCH_ENTER(et);
+				} else {
+					ng_apply_item(node, item, rw);
+				}
+
+				NG_NODE_UNREF(node);
+			}
+		}
+		NET_EPOCH_EXIT(et);
+		NG_NODE_UNREF(node);
+		CURVNET_RESTORE();
+	}
+}
 
 /*
  * XXX
  * It's possible that a debugging NG_NODE_REF may need
  * to be outside the mutex zone
  */
- static void
- ng_worklist_add(node_p node)
- {
-	 mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
- 
-	 if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
-		 node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
-		 NG_NODE_REF(node);
-		 STAILQ_INSERT_TAIL(&local_worklist, node, nd_input_queue.q_work);
-		 NG_WORKLIST_WAKEUP();
-	 }
- }
+static void
+ng_worklist_add(node_p node)
+{
+
+	mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
+
+	if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
+		/*
+		 * If we are not already on the work queue,
+		 * then put us on.
+		 */
+		node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
+		NG_NODE_REF(node); /* XXX safe in mutex? */
+		NG_WORKLIST_LOCK();
+		STAILQ_INSERT_TAIL(&ng_worklist, node, nd_input_queue.q_work);
+		NG_WORKLIST_UNLOCK();
+		CTR3(KTR_NET, "%20s: node [%x] (%p) put on worklist", __func__,
+		    node->nd_ID, node);
+		NG_WORKLIST_WAKEUP();
+	} else {
+		CTR3(KTR_NET, "%20s: node [%x] (%p) already on worklist",
+		    __func__, node->nd_ID, node);
+	}
+}
+
 /***********************************************************************
 * Externally useable functions to set up a queue item ready for sending
 ***********************************************************************/
