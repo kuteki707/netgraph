@@ -2039,36 +2039,30 @@ ng_dequeue(node_p node, int *rw)
  * If the queue could be run now, add node to the queue handler's worklist.
  */
 static __inline void
-ng_queue_rw(node_p node, item_p item, int rw)
+ng_queue_rw(node_p node, item_p  item, int rw)
 {
-    struct ng_queue *ngq = &node->nd_input_queue;
-    if (rw == NGQRW_W)
-        NGI_SET_WRITER(item);
-    else
-        NGI_SET_READER(item);
-    item->depth = 1;
+	struct ng_queue *ngq = &node->nd_input_queue;
+	if (rw == NGQRW_W)
+		NGI_SET_WRITER(item);
+	else
+		NGI_SET_READER(item);
+	item->depth = 1;
 
-    /* Lock-free enqueue using STAILQ semantics */
-    struct ng_item **tail;
-    do {
-        tail = ngq->queue.stqh_last;
-        item->el_next.stqe_next = NULL;  // Correct field name
-    } while (!atomic_cmpset_ptr((uintptr_t *)tail,
-                               (uintptr_t)NULL,  // Compare expected NULL tail
-                               (uintptr_t)item)); // Set new item as tail
+	NG_QUEUE_LOCK(ngq);
+	/* Set OP_PENDING flag and enqueue the item. */
+	atomic_set_int(&ngq->q_flags, OP_PENDING);
+	STAILQ_INSERT_TAIL(&ngq->queue, item, el_next);
 
-    /* Update flags atomically if needed */
-    if (!(atomic_load_acq_int(&ngq->q_flags) & OP_PENDING))
-        atomic_set_rel_int(&ngq->q_flags, OP_PENDING);
+	CTR5(KTR_NET, "%20s: node [%x] (%p) queued item %p as %s", __func__,
+	    node->nd_ID, node, item, rw ? "WRITER" : "READER" );
 
-    CTR5(KTR_NET, "%20s: node [%x] (%p) queued item %p as %s", __func__,
-        node->nd_ID, node, item, rw ? "WRITER" : "READER");
-
-    /* Worklist addition remains locked */
-    NG_QUEUE_LOCK(ngq);
-    if (NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-        ng_worklist_add(node);
-    NG_QUEUE_UNLOCK(ngq);
+	/*
+	 * We can take the worklist lock with the node locked
+	 * BUT NOT THE REVERSE!
+	 */
+	if (NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
+		ng_worklist_add(node);
+	NG_QUEUE_UNLOCK(ngq);
 }
 
 /* Acquire reader lock on node. If node is busy, queue the packet. */
