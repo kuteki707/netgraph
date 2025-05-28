@@ -63,6 +63,7 @@
 #include <sys/unistd.h>
 #include <machine/cpu.h>
 #include <vm/uma.h>
+#include <sys/sched.h>
 
 #include <machine/stack.h>
 
@@ -167,8 +168,14 @@ struct ng_hook ng_deadhook = {
  * END DEAD STRUCTURES
  */
 /* List nodes with unallocated work */
-static STAILQ_HEAD(, ng_node) ng_worklist = STAILQ_HEAD_INITIALIZER(ng_worklist);
-static struct mtx	ng_worklist_mtx;   /* MUST LOCK NODE FIRST */
+
+struct ng_worklist_percpu {
+    STAILQ_HEAD(, ng_node) worklist;
+    struct mtx mtx;
+    int sleeping_threads;
+};
+
+DPCPU_DEFINE_STATIC(struct ng_worklist_percpu, ng_worklist_percpu);
 
 /* List of installed types */
 static LIST_HEAD(, ng_type) ng_typelist;
@@ -270,16 +277,12 @@ static MALLOC_DEFINE(M_NETGRAPH_ITEM, "netgraph_item",
 	mtx_lock(&(n)->q_mtx)
 #define	NG_QUEUE_UNLOCK(n)			\
 	mtx_unlock(&(n)->q_mtx)
-#define	NG_WORKLIST_LOCK_INIT()			\
-	mtx_init(&ng_worklist_mtx, "ng_worklist", NULL, MTX_DEF)
-#define	NG_WORKLIST_LOCK()			\
-	mtx_lock(&ng_worklist_mtx)
-#define	NG_WORKLIST_UNLOCK()			\
-	mtx_unlock(&ng_worklist_mtx)
-#define	NG_WORKLIST_SLEEP()			\
-	mtx_sleep(&ng_worklist, &ng_worklist_mtx, PI_NET, "sleep", 0)
-#define	NG_WORKLIST_WAKEUP()			\
-	wakeup_one(&ng_worklist)
+// Remove the old worklist mutex references - replace the macros
+#define	NG_WORKLIST_LOCK_INIT()		/* no-op now */
+#define	NG_WORKLIST_LOCK()		/* no-op now */  
+#define	NG_WORKLIST_UNLOCK()		/* no-op now */
+#define	NG_WORKLIST_SLEEP()		/* no-op now */
+#define	NG_WORKLIST_WAKEUP()		/* no-op now */
 
 #ifdef NETGRAPH_DEBUG /*----------------------------------------------*/
 /*
@@ -2069,28 +2072,63 @@ ng_queue_rw(node_p node, item_p  item, int rw)
 static __inline item_p
 ng_acquire_read(node_p node, item_p item)
 {
-	KASSERT(node != &ng_deadnode,
-	    ("%s: working on deadnode", __func__));
+    uint32_t old_flags, new_flags;
+    
+    KASSERT(node != &ng_deadnode,
+        ("%s: working on deadnode", __func__));
 
-	/* Reader needs node without writer and pending items. */
-	for (;;) {
-		long t = node->nd_input_queue.q_flags;
-		if (t & NGQ_RMASK)
-			break; /* Node is not ready for reader. */
-		if (atomic_cmpset_acq_int(&node->nd_input_queue.q_flags, t,
-		    t + READER_INCREMENT)) {
-	    		/* Successfully grabbed node */
-			CTR4(KTR_NET, "%20s: node [%x] (%p) acquired item %p",
-			    __func__, node->nd_ID, node, item);
-			return (item);
-		}
-		cpu_spinwait();
-	}
+    /* Fast path: try lock-free atomic increment first */
+    for (int spin_count = 0; spin_count < 100; spin_count++) {
+        old_flags = atomic_load_acq_32(&node->nd_input_queue.q_flags);
+        
+        /* Check if we can proceed without mutex */
+        if (__predict_false(old_flags & NGQ_RMASK)) {
+            /* Writer active or pending operations - use slow path */
+            break;
+        }
+        
+        new_flags = old_flags + READER_INCREMENT;
+        
+        /* Check for overflow/safety barrier */
+        if (__predict_false(new_flags & SAFETY_BARRIER)) {
+            /* Too many readers - use slow path */
+            break;
+        }
+        
+        /* Try to atomically increment reader count */
+        if (atomic_cmpset_acq_32(&node->nd_input_queue.q_flags, 
+                                 old_flags, new_flags)) {
+            /* Success! We acquired read access without any locks */
+            CTR4(KTR_NET, "%20s: node [%x] (%p) acquired item %p (fast path)",
+                __func__, node->nd_ID, node, item);
+            return (item);
+        }
+        
+        /* CAS failed due to contention, spin briefly and retry */
+        cpu_spinwait();
+    }
+    
+    /* 
+     * Fast path failed - fall back to original implementation
+     * This handles cases with writers, pending ops, or high contention
+     */
+    for (;;) {
+        long t = node->nd_input_queue.q_flags;
+        if (t & NGQ_RMASK)
+            break; /* Node is not ready for reader. */
+        if (atomic_cmpset_acq_32(&node->nd_input_queue.q_flags, t,
+            t + READER_INCREMENT)) {
+            /* Successfully grabbed node via slow path */
+            CTR4(KTR_NET, "%20s: node [%x] (%p) acquired item %p (slow path)",
+                __func__, node->nd_ID, node, item);
+            return (item);
+        }
+        cpu_spinwait();
+    }
 
-	/* Queue the request for later. */
-	ng_queue_rw(node, item, NGQRW_R);
-
-	return (NULL);
+    /* Queue the request for later. */
+    ng_queue_rw(node, item, NGQRW_R);
+    return (NULL);
 }
 
 /* Acquire writer lock on node. If node is busy, queue the packet. */
@@ -2256,32 +2294,42 @@ ng_snd_item(item_p item, int flags)
     int queue, rw;
     struct ng_queue *ngq;
     int error = 0;
+    struct epoch_tracker et;
 
-    /* Ensure the item is valid */
+    /* We are sending item, so it must be present! */
     KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
 
 #ifdef NETGRAPH_DEBUG
     _ngi_check(item, __FILE__, __LINE__);
 #endif
 
-    /* Increment reference count for apply callback if present */
+    /* Item was sent once more, postpone apply() call. */
     if (item->apply)
         refcount_acquire(&item->apply->refs);
 
+    /* Enter epoch for safe node/hook access without locks */
+    NET_EPOCH_ENTER(et);
+
     node = NGI_NODE(item);
+    /* Node is never optional. */
     KASSERT(node != NULL, ("ng_snd_item: node is NULL"));
 
     hook = NGI_HOOK(item);
-
-    /* Validate data items */
+    /* Valid hook and mbuf are mandatory for data. */
     if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
         KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
-        if (NGI_M(item) == NULL)
+        if (NGI_M(item) == NULL) {
+            NET_EPOCH_EXIT(et);
             ERROUT(EINVAL);
+        }
         CHECK_DATA_MBUF(NGI_M(item));
     }
 
-    /* Determine if the item requires writer semantics */
+    /*
+     * If the item or the node specifies single threading, force
+     * writer semantics. Similarly, the node may say one hook always
+     * produces writers. These are overrides.
+     */
     if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
         (node->nd_flags & NGF_FORCE_WRITER) ||
         (hook && (hook->hk_flags & HK_FORCE_WRITER))) {
@@ -2290,16 +2338,25 @@ ng_snd_item(item_p item, int flags)
         rw = NGQRW_R;
     }
 
-    /* Decide whether to queue the item */
+    /*
+     * If sender or receiver requests queued delivery, or call graph
+     * loops back from outbound to inbound path, or stack usage
+     * level is dangerous - enqueue message.
+     */
     if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
         queue = 1;
     } else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
-               curthread->td_ng_outbound) {
+        curthread->td_ng_outbound) {
         queue = 1;
     } else {
         queue = 0;
-
-        /* Check stack usage to decide if queuing is necessary */
+        /*
+         * Most of netgraph nodes have small stack consumption and
+         * for them 25% of free stack space is more than enough.
+         * Nodes/hooks with higher stack usage should be marked as
+         * HI_STACK. For them 50% of stack will be guaranteed then.
+         * XXX: Values 25% and 50% are completely empirical.
+         */
         size_t st, su, sl;
         GET_STACK_USAGE(st, su);
         sl = st - su;
@@ -2310,58 +2367,64 @@ ng_snd_item(item_p item, int flags)
     }
 
     if (queue) {
-        /* Queue the item for later processing */
+        /* Put it on the queue for that node*/
         ng_queue_rw(node, item, rw);
+        NET_EPOCH_EXIT(et);
         return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
     }
 
-    /* Enter epoch for safe concurrent access */
-    struct epoch_tracker et;
-    NET_EPOCH_ENTER(et);
-
-    /* Attempt to acquire the appropriate lock */
+    /*
+     * We already decided how we will be queueud or treated.
+     * Try get the appropriate operating permission.
+     */
     if (rw == NGQRW_R)
         item = ng_acquire_read(node, item);
     else
         item = ng_acquire_write(node, item);
 
-    /* If the item was queued, return */
+    /* Item was queued while trying to get permission. */
     if (item == NULL) {
         NET_EPOCH_EXIT(et);
         return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
     }
 
-    /* Process the item */
-    NGI_GET_NODE(item, node); /* Clear stored node */
+    NGI_GET_NODE(item, node); /* zaps stored node */
     item->depth++;
-    error = ng_apply_item(node, item, rw); /* Drops r/w lock when done */
 
-    /* Check if there are more items in the queue */
+    /* 
+     * Exit epoch now that we have the node lock - the rest of the
+     * processing is synchronous and protected by the acquired lock
+     */
+    NET_EPOCH_EXIT(et);
+
+    error = ng_apply_item(node, item, rw); /* drops r/w lock when done */
+
+    /* Check for queued work and schedule it on per-CPU worklist */
     ngq = &node->nd_input_queue;
     if (QUEUE_ACTIVE(ngq)) {
         NG_QUEUE_LOCK(ngq);
         if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-            ng_worklist_add(node);
+            ng_worklist_add(node);  /* This now uses per-CPU worklists */
         NG_QUEUE_UNLOCK(ngq);
     }
 
-    /* Release the node reference */
+    /*
+     * Node may go away as soon as we remove the reference.
+     * Whatever we do, DO NOT access the node again!
+     */
     NG_NODE_UNREF(node);
-
-    NET_EPOCH_EXIT(et);
     return (error);
 
 done:
-    /* Handle errors and apply callback if necessary */
+    /* If was not sent, apply callback here. */
     if (item->apply != NULL) {
         if (item->depth == 0 && error != 0)
             item->apply->error = error;
         if (refcount_release(&item->apply->refs)) {
             (*item->apply->apply)(item->apply->context,
-                                  item->apply->error);
+                item->apply->error);
         }
     }
-
     NG_FREE_ITEM(item);
     return (error);
 }
@@ -2951,6 +3014,20 @@ ngb_mod_event(module_t mod, int event, void *data)
 
 	switch (event) {
 	case MOD_LOAD:
+		 /* Initialize per-CPU worklists */
+        {  // Add block scope to fix C23 extension warning
+            struct ng_worklist_percpu *wl;
+            int cpu;
+            CPU_FOREACH(cpu) {
+                wl = DPCPU_ID_PTR(cpu, ng_worklist_percpu);
+                STAILQ_INIT(&wl->worklist);
+                mtx_init(&wl->mtx, "ng_worklist_percpu", NULL, MTX_DEF);
+                wl->sleeping_threads = 0;
+            }
+        }
+        /* Initialize everything. */
+        // Remove NG_WORKLIST_LOCK_INIT(); line
+        rw_init(&ng_typelist_lock, "netgraph types");
 		/* Initialize everything. */
 		NG_WORKLIST_LOCK_INIT();
 		rw_init(&ng_typelist_lock, "netgraph types");
@@ -2976,12 +3053,13 @@ ngb_mod_event(module_t mod, int event, void *data)
 		/* Create threads. */
     		p = NULL; /* start with no process */
 		for (i = 0; i < numthreads; i++) {
-			if (kproc_kthread_add(ngthread, NULL, &p, &td,
-			    RFHIGHPID, 0, "ng_queue", "ng_queue%d", i)) {
-				numthreads = i;
-				break;
-			}
-		}
+            if (kproc_kthread_add(ngthread, (void *)(uintptr_t)(i % mp_ncpus), 
+                                 &p, &td, RFHIGHPID, 0, "ng_queue", 
+                                 "ng_queue%d", i)) {
+                numthreads = i;
+                break;
+            }
+        }
 		break;
 	case MOD_UNLOAD:
 		/* You can't unload it because an interface may be using it. */
@@ -3149,62 +3227,61 @@ SYSCTL_PROC(_debug, OID_AUTO, ng_dump_items,
 static void
 ngthread(void *arg)
 {
-	for (;;) {
-		struct epoch_tracker et;
-		node_p  node;
-
-		/* Get node from the worklist. */
-		NG_WORKLIST_LOCK();
-		while ((node = STAILQ_FIRST(&ng_worklist)) == NULL)
-			NG_WORKLIST_SLEEP();
-		STAILQ_REMOVE_HEAD(&ng_worklist, nd_input_queue.q_work);
-		NG_WORKLIST_UNLOCK();
-		CURVNET_SET(node->nd_vnet);
-		CTR3(KTR_NET, "%20s: node [%x] (%p) taken off worklist",
-		    __func__, node->nd_ID, node);
-		/*
-		 * We have the node. We also take over the reference
-		 * that the list had on it.
-		 * Now process as much as you can, until it won't
-		 * let you have another item off the queue.
-		 * All this time, keep the reference
-		 * that lets us be sure that the node still exists.
-		 * Let the reference go at the last minute.
-		 */
-		NET_EPOCH_ENTER(et);
-		for (;;) {
-			item_p item;
-			int rw;
-
-			NG_QUEUE_LOCK(&node->nd_input_queue);
-			item = ng_dequeue(node, &rw);
-			if (item == NULL) {
-				node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
-				NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				break; /* go look for another node */
-			} else {
-				NG_QUEUE_UNLOCK(&node->nd_input_queue);
-				NGI_GET_NODE(item, node); /* zaps stored node */
-
-				if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
-					/*
-					 * NGQF_MESG items should never be processed in
-					 * NET_EPOCH context. So, temporary exit from EPOCH.
-					 */
-					NET_EPOCH_EXIT(et);
-					ng_apply_item(node, item, rw);
-					NET_EPOCH_ENTER(et);
-				} else {
-					ng_apply_item(node, item, rw);
-				}
-
-				NG_NODE_UNREF(node);
-			}
-		}
-		NET_EPOCH_EXIT(et);
-		NG_NODE_UNREF(node);
-		CURVNET_RESTORE();
-	}
+    int cpu = (int)(uintptr_t)arg;
+    struct ng_worklist_percpu *wl = DPCPU_ID_PTR(cpu, ng_worklist_percpu);
+    cpuset_t mask;
+    
+    /* Set CPU affinity for this thread */
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+    cpuset_setthread(curthread->td_tid, &mask);
+    
+    for (;;) {
+        struct epoch_tracker et;
+        node_p node;
+        
+        /* Get node from our CPU's worklist */
+        mtx_lock(&wl->mtx);
+        while ((node = STAILQ_FIRST(&wl->worklist)) == NULL) {
+            wl->sleeping_threads++;
+            mtx_sleep(&wl->worklist, &wl->mtx, PI_NET, "ng_sleep", 0);
+        }
+        STAILQ_REMOVE_HEAD(&wl->worklist, nd_input_queue.q_work);
+        mtx_unlock(&wl->mtx);
+        
+        CURVNET_SET(node->nd_vnet);
+        CTR4(KTR_NET, "%20s: node [%x] (%p) taken off worklist CPU %d",
+             __func__, node->nd_ID, node, cpu);
+        
+        NET_EPOCH_ENTER(et);
+        for (;;) {
+            item_p item;
+            int rw;
+            
+            NG_QUEUE_LOCK(&node->nd_input_queue);
+            item = ng_dequeue(node, &rw);
+            if (item == NULL) {
+                node->nd_input_queue.q_flags2 &= ~NGQ2_WORKQ;
+                NG_QUEUE_UNLOCK(&node->nd_input_queue);
+                break;
+            } else {
+                NG_QUEUE_UNLOCK(&node->nd_input_queue);
+                NGI_GET_NODE(item, node);
+                
+                if ((item->el_flags & NGQF_TYPE) == NGQF_MESG) {
+                    NET_EPOCH_EXIT(et);
+                    ng_apply_item(node, item, rw);
+                    NET_EPOCH_ENTER(et);
+                } else {
+                    ng_apply_item(node, item, rw);
+                }
+                NG_NODE_UNREF(node);
+            }
+        }
+        NET_EPOCH_EXIT(et);
+        NG_NODE_UNREF(node);
+        CURVNET_RESTORE();
+    }
 }
 
 /*
@@ -3215,26 +3292,33 @@ ngthread(void *arg)
 static void
 ng_worklist_add(node_p node)
 {
+    struct ng_worklist_percpu *wl;
+    int cpu;
 
-	mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
+    mtx_assert(&node->nd_input_queue.q_mtx, MA_OWNED);
 
-	if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
-		/*
-		 * If we are not already on the work queue,
-		 * then put us on.
-		 */
-		node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
-		NG_NODE_REF(node); /* XXX safe in mutex? */
-		NG_WORKLIST_LOCK();
-		STAILQ_INSERT_TAIL(&ng_worklist, node, nd_input_queue.q_work);
-		NG_WORKLIST_UNLOCK();
-		CTR3(KTR_NET, "%20s: node [%x] (%p) put on worklist", __func__,
-		    node->nd_ID, node);
-		NG_WORKLIST_WAKEUP();
-	} else {
-		CTR3(KTR_NET, "%20s: node [%x] (%p) already on worklist",
-		    __func__, node->nd_ID, node);
-	}
+    if ((node->nd_input_queue.q_flags2 & NGQ2_WORKQ) == 0) {
+        node->nd_input_queue.q_flags2 |= NGQ2_WORKQ;
+        NG_NODE_REF(node);
+        
+        /* Use current CPU for locality */
+        cpu = curcpu;
+        wl = DPCPU_ID_PTR(cpu, ng_worklist_percpu);
+        
+        mtx_lock(&wl->mtx);
+        STAILQ_INSERT_TAIL(&wl->worklist, node, nd_input_queue.q_work);
+        if (wl->sleeping_threads > 0) {
+            wakeup_one(&wl->worklist);
+            wl->sleeping_threads--;
+        }
+        mtx_unlock(&wl->mtx);
+        
+        CTR4(KTR_NET, "%20s: node [%x] (%p) put on worklist CPU %d", 
+             __func__, node->nd_ID, node, cpu);
+    } else {
+        CTR3(KTR_NET, "%20s: node [%x] (%p) already on worklist",
+            __func__, node->nd_ID, node);
+    }
 }
 
 /***********************************************************************
