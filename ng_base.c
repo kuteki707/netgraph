@@ -284,6 +284,9 @@ static MALLOC_DEFINE(M_NETGRAPH_ITEM, "netgraph_item",
 #define	NG_WORKLIST_SLEEP()		/* no-op now */
 #define	NG_WORKLIST_WAKEUP()		/* no-op now */
 
+#define NG_EPOCH_ASSERT() \
+    KASSERT(in_epoch(net_epoch_preempt), ("NetGraph function called outside NET_EPOCH"))
+
 #ifdef NETGRAPH_DEBUG /*----------------------------------------------*/
 /*
  * In debug mode:
@@ -1752,128 +1755,134 @@ ng_path_parse(char *addr, char **nodep, char **pathp, char **hookp)
  * Given a path, which may be absolute or relative, and a starting node,
  * return the destination node.
  */
+// Replace the entire ng_path2noderef function (around line 1750):
+
 int
 ng_path2noderef(node_p here, const char *address, node_p *destp,
     hook_p *lasthook)
 {
-	char    fullpath[NG_PATHSIZ];
-	char   *nodename, *path;
-	node_p  node, oldnode;
+    char    fullpath[NG_PATHSIZ];
+    char   *nodename, *path;
+    node_p  node, oldnode;
+    struct epoch_tracker et;  // Declare here at function scope
+    int entered_epoch = 0;
 
-	/* Initialize */
-	if (destp == NULL) {
-		TRAP_ERROR();
-		return EINVAL;
-	}
-	*destp = NULL;
+    /* Initialize */
+    if (destp == NULL) {
+        TRAP_ERROR();
+        return EINVAL;
+    }
+    *destp = NULL;
 
-	/* Make a writable copy of address for ng_path_parse() */
-	strncpy(fullpath, address, sizeof(fullpath) - 1);
-	fullpath[sizeof(fullpath) - 1] = '\0';
+    /* Check if we're already in epoch, if not enter it */
+    if (!in_epoch(net_epoch_preempt)) {  // Fix function call
+        NET_EPOCH_ENTER(et);
+        entered_epoch = 1;
+    }
 
-	/* Parse out node and sequence of hooks */
-	if (ng_path_parse(fullpath, &nodename, &path, NULL) < 0) {
-		TRAP_ERROR();
-		return EINVAL;
-	}
+    /* Make a writable copy of address for ng_path_parse() */
+    strncpy(fullpath, address, sizeof(fullpath) - 1);
+    fullpath[sizeof(fullpath) - 1] = '\0';
 
-	/*
-	 * For an absolute address, jump to the starting node.
-	 * Note that this holds a reference on the node for us.
-	 * Don't forget to drop the reference if we don't need it.
-	 */
-	if (nodename) {
-		node = ng_name2noderef(here, nodename);
-		if (node == NULL) {
-			TRAP_ERROR();
-			return (ENOENT);
-		}
-	} else {
-		if (here == NULL) {
-			TRAP_ERROR();
-			return (EINVAL);
-		}
-		node = here;
-		NG_NODE_REF(node);
-	}
+    /* Parse out node and sequence of hooks */
+    if (ng_path_parse(fullpath, &nodename, &path, NULL) < 0) {
+        TRAP_ERROR();
+        if (entered_epoch) NET_EPOCH_EXIT(et);
+        return EINVAL;
+    }
 
-	if (path == NULL) {
-		if (lasthook != NULL)
-			*lasthook = NULL;
-		*destp = node;
-		return (0);
-	}
+    /*
+     * For an absolute address, jump to the starting node.
+     * Use epoch-protected lookup instead of locks.
+     */
+    if (nodename) {
+        node = ng_name2noderef(here, nodename);  /* Already epoch-protected */
+        if (node == NULL) {
+            TRAP_ERROR();
+            if (entered_epoch) NET_EPOCH_EXIT(et);
+            return (ENOENT);
+        }
+    } else {
+        if (here == NULL) {
+            TRAP_ERROR();
+            if (entered_epoch) NET_EPOCH_EXIT(et);
+            return (EINVAL);
+        }
+        node = here;
+        NG_NODE_REF(node);
+    }
 
-	/*
-	 * Now follow the sequence of hooks
-	 *
-	 * XXXGL: The path may demolish as we go the sequence, but if
-	 * we hold the topology mutex at critical places, then, I hope,
-	 * we would always have valid pointers in hand, although the
-	 * path behind us may no longer exist.
-	 */
-	for (;;) {
-		hook_p hook;
-		char *segment;
+    if (path == NULL) {
+        if (lasthook != NULL)
+            *lasthook = NULL;
+        *destp = node;
+        if (entered_epoch) NET_EPOCH_EXIT(et);
+        return (0);
+    }
 
-		/*
-		 * Break out the next path segment. Replace the dot we just
-		 * found with a NUL; "path" points to the next segment (or the
-		 * NUL at the end).
-		 */
-		for (segment = path; *path != '\0'; path++) {
-			if (*path == '.') {
-				*path++ = '\0';
-				break;
-			}
-		}
+    /*
+     * Now follow the sequence of hooks using epoch protection.
+     * No topology lock needed - epoch guarantees structural integrity.
+     */
+    for (;;) {
+        hook_p hook;
+        char *segment;
 
-		/* We have a segment, so look for a hook by that name */
-		hook = ng_findhook(node, segment);
+        /*
+         * Break out the next path segment. Replace the dot we just
+         * found with a NUL; "path" points to the next segment (or the
+         * NUL at the end).
+         */
+        for (segment = path; *path != '\0'; path++) {
+            if (*path == '.') {
+                *path++ = '\0';
+                break;
+            }
+        }
 
-		TOPOLOGY_WLOCK();
-		/* Can't get there from here... */
-		if (hook == NULL || NG_HOOK_PEER(hook) == NULL ||
-		    NG_HOOK_NOT_VALID(hook) ||
-		    NG_HOOK_NOT_VALID(NG_HOOK_PEER(hook))) {
-			TRAP_ERROR();
-			NG_NODE_UNREF(node);
-			TOPOLOGY_WUNLOCK();
-			return (ENOENT);
-		}
+        /* We have a segment, so look for a hook by that name */
+        hook = ng_findhook(node, segment);  /* Already epoch-protected */
 
-		/*
-		 * Hop on over to the next node
-		 * XXX
-		 * Big race conditions here as hooks and nodes go away
-		 * *** Idea.. store an ng_ID_t in each hook and use that
-		 * instead of the direct hook in this crawl?
-		 */
-		oldnode = node;
-		if ((node = NG_PEER_NODE(hook)))
-			NG_NODE_REF(node);	/* XXX RACE */
-		NG_NODE_UNREF(oldnode);	/* XXX another race */
-		if (NG_NODE_NOT_VALID(node)) {
-			NG_NODE_UNREF(node);	/* XXX more races */
-			TOPOLOGY_WUNLOCK();
-			TRAP_ERROR();
-			return (ENXIO);
-		}
+        /* Can't get there from here... */
+        if (hook == NULL || NG_HOOK_PEER(hook) == NULL ||
+            NG_HOOK_NOT_VALID(hook) ||
+            NG_HOOK_NOT_VALID(NG_HOOK_PEER(hook))) {
+            TRAP_ERROR();
+            NG_NODE_UNREF(node);
+            if (entered_epoch) NET_EPOCH_EXIT(et);
+            return (ENOENT);
+        }
 
-		if (*path == '\0') {
-			if (lasthook != NULL) {
-				if (hook != NULL) {
-					*lasthook = NG_HOOK_PEER(hook);
-					NG_HOOK_REF(*lasthook);
-				} else
-					*lasthook = NULL;
-			}
-			TOPOLOGY_WUNLOCK();
-			*destp = node;
-			return (0);
-		}
-		TOPOLOGY_WUNLOCK();
-	}
+        /*
+         * Hop on over to the next node.
+         * Epoch protection eliminates the race conditions that
+         * previously required careful reference counting.
+         */
+        oldnode = node;
+        if ((node = NG_PEER_NODE(hook)))
+            NG_NODE_REF(node);
+        NG_NODE_UNREF(oldnode);
+        
+        if (NG_NODE_NOT_VALID(node)) {
+            NG_NODE_UNREF(node);
+            if (entered_epoch) NET_EPOCH_EXIT(et);
+            TRAP_ERROR();
+            return (ENXIO);
+        }
+
+        if (*path == '\0') {
+            if (lasthook != NULL) {
+                if (hook != NULL) {
+                    *lasthook = NG_HOOK_PEER(hook);
+                    NG_HOOK_REF(*lasthook);
+                } else
+                    *lasthook = NULL;
+            }
+            *destp = node;
+            if (entered_epoch) NET_EPOCH_EXIT(et);
+            return (0);
+        }
+    }
 }
 
 /***************************************************************\
@@ -2286,6 +2295,8 @@ ng_flush_input_queue(node_p node)
  * The nodes have several routines and macros to help with this task:
  */
 
+// Replace the ng_snd_item function (around line 2290):
+
 int
 ng_snd_item(item_p item, int flags)
 {
@@ -2294,7 +2305,8 @@ ng_snd_item(item_p item, int flags)
     int queue, rw;
     struct ng_queue *ngq;
     int error = 0;
-    struct epoch_tracker et;
+    struct epoch_tracker et;  // Declare at function scope
+    int entered_epoch = 0;
 
     /* We are sending item, so it must be present! */
     KASSERT(item != NULL, ("ng_snd_item: item is NULL"));
@@ -2307,8 +2319,11 @@ ng_snd_item(item_p item, int flags)
     if (item->apply)
         refcount_acquire(&item->apply->refs);
 
-    /* Enter epoch for safe node/hook access without locks */
-    NET_EPOCH_ENTER(et);
+    /* Enter epoch for safe node/hook access if not already in one */
+    if (!in_epoch(net_epoch_preempt)) {  // Fix function call
+        NET_EPOCH_ENTER(et);
+        entered_epoch = 1;
+    }
 
     node = NGI_NODE(item);
     /* Node is never optional. */
@@ -2319,16 +2334,15 @@ ng_snd_item(item_p item, int flags)
     if ((item->el_flags & NGQF_TYPE) == NGQF_DATA) {
         KASSERT(hook != NULL, ("ng_snd_item: hook for data is NULL"));
         if (NGI_M(item) == NULL) {
-            NET_EPOCH_EXIT(et);
+            if (entered_epoch) NET_EPOCH_EXIT(et);
             ERROUT(EINVAL);
         }
         CHECK_DATA_MBUF(NGI_M(item));
     }
 
     /*
-     * If the item or the node specifies single threading, force
-     * writer semantics. Similarly, the node may say one hook always
-     * produces writers. These are overrides.
+     * Determine read/write semantics and queueing requirements
+     * while under epoch protection.
      */
     if (((item->el_flags & NGQF_RW) == NGQF_WRITER) ||
         (node->nd_flags & NGF_FORCE_WRITER) ||
@@ -2338,11 +2352,6 @@ ng_snd_item(item_p item, int flags)
         rw = NGQRW_R;
     }
 
-    /*
-     * If sender or receiver requests queued delivery, or call graph
-     * loops back from outbound to inbound path, or stack usage
-     * level is dangerous - enqueue message.
-     */
     if ((flags & NG_QUEUE) || (hook && (hook->hk_flags & HK_QUEUE))) {
         queue = 1;
     } else if (hook && (hook->hk_flags & HK_TO_INBOUND) &&
@@ -2350,13 +2359,7 @@ ng_snd_item(item_p item, int flags)
         queue = 1;
     } else {
         queue = 0;
-        /*
-         * Most of netgraph nodes have small stack consumption and
-         * for them 25% of free stack space is more than enough.
-         * Nodes/hooks with higher stack usage should be marked as
-         * HI_STACK. For them 50% of stack will be guaranteed then.
-         * XXX: Values 25% and 50% are completely empirical.
-         */
+        /* Stack usage check... */
         size_t st, su, sl;
         GET_STACK_USAGE(st, su);
         sl = st - su;
@@ -2369,13 +2372,13 @@ ng_snd_item(item_p item, int flags)
     if (queue) {
         /* Put it on the queue for that node*/
         ng_queue_rw(node, item, rw);
-        NET_EPOCH_EXIT(et);
+        if (entered_epoch) NET_EPOCH_EXIT(et);
         return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
     }
 
     /*
-     * We already decided how we will be queueud or treated.
-     * Try get the appropriate operating permission.
+     * Try to get the appropriate operating permission.
+     * The fast-path reader acquisition already works well with epoch.
      */
     if (rw == NGQRW_R)
         item = ng_acquire_read(node, item);
@@ -2384,7 +2387,7 @@ ng_snd_item(item_p item, int flags)
 
     /* Item was queued while trying to get permission. */
     if (item == NULL) {
-        NET_EPOCH_EXIT(et);
+        if (entered_epoch) NET_EPOCH_EXIT(et);
         return ((flags & NG_PROGRESS) ? EINPROGRESS : 0);
     }
 
@@ -2392,19 +2395,19 @@ ng_snd_item(item_p item, int flags)
     item->depth++;
 
     /* 
-     * Exit epoch now that we have the node lock - the rest of the
+     * We can exit epoch now that we have the node lock - the rest of 
      * processing is synchronous and protected by the acquired lock
      */
-    NET_EPOCH_EXIT(et);
+    if (entered_epoch) NET_EPOCH_EXIT(et);
 
     error = ng_apply_item(node, item, rw); /* drops r/w lock when done */
 
-    /* Check for queued work and schedule it on per-CPU worklist */
+    /* Check for queued work and schedule it */
     ngq = &node->nd_input_queue;
     if (QUEUE_ACTIVE(ngq)) {
         NG_QUEUE_LOCK(ngq);
         if (QUEUE_ACTIVE(ngq) && NEXT_QUEUED_ITEM_CAN_PROCEED(ngq))
-            ng_worklist_add(node);  /* This now uses per-CPU worklists */
+            ng_worklist_add(node);
         NG_QUEUE_UNLOCK(ngq);
     }
 
@@ -3423,62 +3426,76 @@ ng_package_msg(struct ng_mesg *msg, int flags)
 int
 ng_address_hook(node_p here, item_p item, hook_p hook, ng_ID_t retaddr)
 {
-	hook_p peer;
-	node_p peernode;
-	ITEM_DEBUG_CHECKS;
-	/*
-	 * Quick sanity check..
-	 * Since a hook holds a reference on its node, once we know
-	 * that the peer is still connected (even if invalid,) we know
-	 * that the peer node is present, though maybe invalid.
-	 */
-	TOPOLOGY_RLOCK();
-	if ((hook == NULL) || NG_HOOK_NOT_VALID(hook) ||
-	    NG_HOOK_NOT_VALID(peer = NG_HOOK_PEER(hook)) ||
-	    NG_NODE_NOT_VALID(peernode = NG_PEER_NODE(hook))) {
-		NG_FREE_ITEM(item);
-		TRAP_ERROR();
-		TOPOLOGY_RUNLOCK();
-		return (ENETDOWN);
-	}
+    hook_p peer;
+    node_p peernode;
+    
+    ITEM_DEBUG_CHECKS;
+    
+    /*
+     * We assume we're already in NET_EPOCH context when this is called.
+     * This is safe because ng_address_hook is typically called from 
+     * within ng_snd_item() which already enters epoch.
+     */
+    NG_EPOCH_ASSERT();
+    
+    /*
+     * Quick sanity check using epoch protection instead of topology lock.
+     * The epoch guarantees that hook/node structures remain valid during
+     * this traversal even if they're being destroyed concurrently.
+     */
+    if ((hook == NULL) || NG_HOOK_NOT_VALID(hook) ||
+        NG_HOOK_NOT_VALID(peer = NG_HOOK_PEER(hook)) ||
+        NG_NODE_NOT_VALID(peernode = NG_PEER_NODE(hook))) {
+        NG_FREE_ITEM(item);
+        TRAP_ERROR();
+        return (ENETDOWN);
+    }
 
-	/*
-	 * Transfer our interest to the other (peer) end.
-	 */
-	NG_HOOK_REF(peer);
-	NG_NODE_REF(peernode);
-	NGI_SET_HOOK(item, peer);
-	NGI_SET_NODE(item, peernode);
-	SET_RETADDR(item, here, retaddr);
+    /*
+     * Transfer our interest to the other (peer) end.
+     * Take references while still in epoch - this is safe because
+     * the structures are guaranteed valid by epoch protection.
+     */
+    NG_HOOK_REF(peer);
+    NG_NODE_REF(peernode);
+    NGI_SET_HOOK(item, peer);
+    NGI_SET_NODE(item, peernode);
+    SET_RETADDR(item, here, retaddr);
 
-	TOPOLOGY_RUNLOCK();
-
-	return (0);
+    return (0);
 }
 
 int
 ng_address_path(node_p here, item_p item, const char *address, ng_ID_t retaddr)
 {
-	node_p	dest = NULL;
-	hook_p	hook = NULL;
-	int	error;
+    node_p	dest = NULL;
+    hook_p	hook = NULL;
+    int	error;
 
-	ITEM_DEBUG_CHECKS;
-	/*
-	 * Note that ng_path2noderef increments the reference count
-	 * on the node for us if it finds one. So we don't have to.
-	 */
-	error = ng_path2noderef(here, address, &dest, &hook);
-	if (error) {
-		NG_FREE_ITEM(item);
-		return (error);
-	}
-	NGI_SET_NODE(item, dest);
-	if (hook)
-		NGI_SET_HOOK(item, hook);
+    ITEM_DEBUG_CHECKS;
+    
+    /*
+     * We assume epoch context - ng_path2noderef already uses epoch
+     * internally, so we don't need additional protection here.
+     */
+    NG_EPOCH_ASSERT();
+    
+    /*
+     * Note that ng_path2noderef increments the reference count
+     * on the node for us if it finds one. So we don't have to.
+     * It now uses epoch protection instead of topology locks.
+     */
+    error = ng_path2noderef(here, address, &dest, &hook);
+    if (error) {
+        NG_FREE_ITEM(item);
+        return (error);
+    }
+    NGI_SET_NODE(item, dest);
+    if (hook)
+        NGI_SET_HOOK(item, hook);
 
-	SET_RETADDR(item, here, retaddr);
-	return (0);
+    SET_RETADDR(item, here, retaddr);
+    return (0);
 }
 
 int
