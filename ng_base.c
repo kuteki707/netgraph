@@ -1755,7 +1755,6 @@ ng_path_parse(char *addr, char **nodep, char **pathp, char **hookp)
  * Given a path, which may be absolute or relative, and a starting node,
  * return the destination node.
  */
-// Replace the entire ng_path2noderef function (around line 1750):
 
 int
 ng_path2noderef(node_p here, const char *address, node_p *destp,
@@ -1764,7 +1763,7 @@ ng_path2noderef(node_p here, const char *address, node_p *destp,
     char    fullpath[NG_PATHSIZ];
     char   *nodename, *path;
     node_p  node, oldnode;
-    struct epoch_tracker et;  // Declare here at function scope
+    struct epoch_tracker et;
     int entered_epoch = 0;
 
     /* Initialize */
@@ -1775,7 +1774,7 @@ ng_path2noderef(node_p here, const char *address, node_p *destp,
     *destp = NULL;
 
     /* Check if we're already in epoch, if not enter it */
-    if (!in_epoch(net_epoch_preempt)) {  // Fix function call
+    if (!in_epoch(net_epoch_preempt)) {
         NET_EPOCH_ENTER(et);
         entered_epoch = 1;
     }
@@ -2295,8 +2294,6 @@ ng_flush_input_queue(node_p node)
  * The nodes have several routines and macros to help with this task:
  */
 
-// Replace the ng_snd_item function (around line 2290):
-
 int
 ng_snd_item(item_p item, int flags)
 {
@@ -2305,7 +2302,7 @@ ng_snd_item(item_p item, int flags)
     int queue, rw;
     struct ng_queue *ngq;
     int error = 0;
-    struct epoch_tracker et;  // Declare at function scope
+    struct epoch_tracker et;
     int entered_epoch = 0;
 
     /* We are sending item, so it must be present! */
@@ -2320,7 +2317,7 @@ ng_snd_item(item_p item, int flags)
         refcount_acquire(&item->apply->refs);
 
     /* Enter epoch for safe node/hook access if not already in one */
-    if (!in_epoch(net_epoch_preempt)) {  // Fix function call
+    if (!in_epoch(net_epoch_preempt)) {
         NET_EPOCH_ENTER(et);
         entered_epoch = 1;
     }
@@ -2750,6 +2747,280 @@ ng_apply_item(node_p node, item_p item, int rw)
 		 }
 		 break;
 	 }
+	 case NGM_LISTNODES:
+	    {
+		struct namelist *nl;
+		node_p node;
+		int i;
+
+		IDHASH_RLOCK();
+		/* Get response struct. */
+		NG_MKRESPONSE(resp, msg, sizeof(*nl) +
+		    (V_ng_nodes * sizeof(struct nodeinfo)), M_NOWAIT);
+		if (resp == NULL) {
+			IDHASH_RUNLOCK();
+			error = ENOMEM;
+			break;
+		}
+		nl = (struct namelist *) resp->data;
+
+		/* Cycle through the lists of nodes. */
+		nl->numnames = 0;
+		for (i = 0; i <= V_ng_ID_hmask; i++) {
+			LIST_FOREACH(node, &V_ng_ID_hash[i], nd_idnodes) {
+				struct nodeinfo *const np =
+				    &nl->nodeinfo[nl->numnames];
+
+				if (NG_NODE_NOT_VALID(node))
+					continue;
+				if (NG_NODE_HAS_NAME(node))
+					strcpy(np->name, NG_NODE_NAME(node));
+				strcpy(np->type, node->nd_type->name);
+				np->id = ng_node2ID(node);
+				np->hooks = node->nd_numhooks;
+				KASSERT(nl->numnames < V_ng_nodes,
+				    ("%s: no space", __func__));
+				nl->numnames++;
+			}
+		}
+		IDHASH_RUNLOCK();
+		break;
+	    }
+	case NGM_LISTNAMES:
+	    {
+		struct namelist *nl;
+		node_p node;
+		int i;
+
+		NAMEHASH_RLOCK();
+		/* Get response struct. */
+		NG_MKRESPONSE(resp, msg, sizeof(*nl) +
+		    (V_ng_named_nodes * sizeof(struct nodeinfo)), M_NOWAIT);
+		if (resp == NULL) {
+			NAMEHASH_RUNLOCK();
+			error = ENOMEM;
+			break;
+		}
+		nl = (struct namelist *) resp->data;
+
+		/* Cycle through the lists of nodes. */
+		nl->numnames = 0;
+		for (i = 0; i <= V_ng_name_hmask; i++) {
+			LIST_FOREACH(node, &V_ng_name_hash[i], nd_nodes) {
+				struct nodeinfo *const np =
+				    &nl->nodeinfo[nl->numnames];
+
+				if (NG_NODE_NOT_VALID(node))
+					continue;
+				strcpy(np->name, NG_NODE_NAME(node));
+				strcpy(np->type, node->nd_type->name);
+				np->id = ng_node2ID(node);
+				np->hooks = node->nd_numhooks;
+				KASSERT(nl->numnames < V_ng_named_nodes,
+				    ("%s: no space", __func__));
+				nl->numnames++;
+			}
+		}
+		NAMEHASH_RUNLOCK();
+		break;
+	    }
+
+	case NGM_LISTTYPES:
+	    {
+		struct typelist *tl;
+		struct ng_type *type;
+		int num = 0;
+
+		TYPELIST_RLOCK();
+		/* Count number of types */
+		LIST_FOREACH(type, &ng_typelist, types)
+			num++;
+
+		/* Get response struct */
+		NG_MKRESPONSE(resp, msg, sizeof(*tl) +
+		    (num * sizeof(struct typeinfo)), M_NOWAIT);
+		if (resp == NULL) {
+			TYPELIST_RUNLOCK();
+			error = ENOMEM;
+			break;
+		}
+		tl = (struct typelist *) resp->data;
+
+		/* Cycle through the linked list of types */
+		tl->numtypes = 0;
+		LIST_FOREACH(type, &ng_typelist, types) {
+			struct typeinfo *const tp = &tl->typeinfo[tl->numtypes];
+
+			strcpy(tp->type_name, type->name);
+			tp->numnodes = type->refs - 1; /* don't count list */
+			KASSERT(tl->numtypes < num, ("%s: no space", __func__));
+			tl->numtypes++;
+		}
+		TYPELIST_RUNLOCK();
+		break;
+	    }
+
+	case NGM_BINARY2ASCII:
+	    {
+		int bufSize = 1024;
+		const struct ng_parse_type *argstype;
+		const struct ng_cmdlist *c;
+		struct ng_mesg *binary, *ascii;
+
+		/* Data area must contain a valid netgraph message */
+		binary = (struct ng_mesg *)msg->data;
+		if (msg->header.arglen < sizeof(struct ng_mesg) ||
+		    (msg->header.arglen - sizeof(struct ng_mesg) <
+		    binary->header.arglen)) {
+			TRAP_ERROR();
+			error = EINVAL;
+			break;
+		}
+retry_b2a:
+		/* Get a response message with lots of room */
+		NG_MKRESPONSE(resp, msg, sizeof(*ascii) + bufSize, M_NOWAIT);
+		if (resp == NULL) {
+			error = ENOMEM;
+			break;
+		}
+		ascii = (struct ng_mesg *)resp->data;
+
+		/* Copy binary message header to response message payload */
+		bcopy(binary, ascii, sizeof(*binary));
+
+		/* Find command by matching typecookie and command number */
+		for (c = here->nd_type->cmdlist; c != NULL && c->name != NULL;
+		    c++) {
+			if (binary->header.typecookie == c->cookie &&
+			    binary->header.cmd == c->cmd)
+				break;
+		}
+		if (c == NULL || c->name == NULL) {
+			for (c = ng_generic_cmds; c->name != NULL; c++) {
+				if (binary->header.typecookie == c->cookie &&
+				    binary->header.cmd == c->cmd)
+					break;
+			}
+			if (c->name == NULL) {
+				NG_FREE_MSG(resp);
+				error = ENOSYS;
+				break;
+			}
+		}
+
+		/* Convert command name to ASCII */
+		snprintf(ascii->header.cmdstr, sizeof(ascii->header.cmdstr),
+		    "%s", c->name);
+
+		/* Convert command arguments to ASCII */
+		argstype = (binary->header.flags & NGF_RESP) ?
+		    c->respType : c->mesgType;
+		if (argstype == NULL) {
+			*ascii->data = '\0';
+		} else {
+			error = ng_unparse(argstype, (u_char *)binary->data,
+			    ascii->data, bufSize);
+			if (error == ERANGE) {
+				NG_FREE_MSG(resp);
+				bufSize *= 2;
+				goto retry_b2a;
+			} else if (error) {
+				NG_FREE_MSG(resp);
+				break;
+			}
+		}
+
+		/* Return the result as struct ng_mesg plus ASCII string */
+		bufSize = strlen(ascii->data) + 1;
+		ascii->header.arglen = bufSize;
+		resp->header.arglen = sizeof(*ascii) + bufSize;
+		break;
+	    }
+
+	case NGM_ASCII2BINARY:
+	    {
+		int bufSize = 20 * 1024;	/* XXX hard coded constant */
+		const struct ng_cmdlist *c;
+		const struct ng_parse_type *argstype;
+		struct ng_mesg *ascii, *binary;
+		int off = 0;
+
+		/* Data area must contain at least a struct ng_mesg + '\0' */
+		ascii = (struct ng_mesg *)msg->data;
+		if ((msg->header.arglen < sizeof(*ascii) + 1) ||
+		    (ascii->header.arglen < 1) ||
+		    (msg->header.arglen < sizeof(*ascii) +
+		    ascii->header.arglen)) {
+			TRAP_ERROR();
+			error = EINVAL;
+			break;
+		}
+		ascii->data[ascii->header.arglen - 1] = '\0';
+
+		/* Get a response message with lots of room */
+		NG_MKRESPONSE(resp, msg, sizeof(*binary) + bufSize, M_NOWAIT);
+		if (resp == NULL) {
+			error = ENOMEM;
+			break;
+		}
+		binary = (struct ng_mesg *)resp->data;
+
+		/* Copy ASCII message header to response message payload */
+		bcopy(ascii, binary, sizeof(*ascii));
+
+		/* Find command by matching ASCII command string */
+		for (c = here->nd_type->cmdlist;
+		    c != NULL && c->name != NULL; c++) {
+			if (strcmp(ascii->header.cmdstr, c->name) == 0)
+				break;
+		}
+		if (c == NULL || c->name == NULL) {
+			for (c = ng_generic_cmds; c->name != NULL; c++) {
+				if (strcmp(ascii->header.cmdstr, c->name) == 0)
+					break;
+			}
+			if (c->name == NULL) {
+				NG_FREE_MSG(resp);
+				error = ENOSYS;
+				break;
+			}
+		}
+
+		/* Convert command name to binary */
+		binary->header.cmd = c->cmd;
+		binary->header.typecookie = c->cookie;
+
+		/* Convert command arguments to binary */
+		argstype = (binary->header.flags & NGF_RESP) ?
+		    c->respType : c->mesgType;
+		if (argstype == NULL) {
+			bufSize = 0;
+		} else {
+			if ((error = ng_parse(argstype, ascii->data, &off,
+			    (u_char *)binary->data, &bufSize)) != 0) {
+				NG_FREE_MSG(resp);
+				break;
+			}
+		}
+
+		/* Return the result */
+		binary->header.arglen = bufSize;
+		resp->header.arglen = sizeof(*binary) + bufSize;
+		break;
+	    }
+
+	case NGM_TEXT_CONFIG:
+	case NGM_TEXT_STATUS:
+		/*
+		 * This one is tricky as it passes the command down to the
+		 * actual node, even though it is a generic type command.
+		 * This means we must assume that the item/msg is already freed
+		 * when control passes back to us.
+		 */
+		if (here->nd_type->rcvmsg != NULL) {
+			NGI_MSG(item) = msg; /* put it back as we found it */
+			return((*here->nd_type->rcvmsg)(here, item, lasthook));
+		}
  
 	 default:
 		 TRAP_ERROR();
@@ -3018,7 +3289,7 @@ ngb_mod_event(module_t mod, int event, void *data)
 	switch (event) {
 	case MOD_LOAD:
 		 /* Initialize per-CPU worklists */
-        {  // Add block scope to fix C23 extension warning
+        {
             struct ng_worklist_percpu *wl;
             int cpu;
             CPU_FOREACH(cpu) {
@@ -3029,10 +3300,6 @@ ngb_mod_event(module_t mod, int event, void *data)
             }
         }
         /* Initialize everything. */
-        // Remove NG_WORKLIST_LOCK_INIT(); line
-        rw_init(&ng_typelist_lock, "netgraph types");
-		/* Initialize everything. */
-		NG_WORKLIST_LOCK_INIT();
 		rw_init(&ng_typelist_lock, "netgraph types");
 		rw_init(&ng_idhash_lock, "netgraph idhash");
 		rw_init(&ng_namehash_lock, "netgraph namehash");
